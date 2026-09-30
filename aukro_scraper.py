@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Extract the currently displayed Aukro category/search result page via CDP.
+"""Extract Aukro listings via CDP, then fetch and clean their offer details.
 
 The script attaches to an existing Chrome instance; it never starts or closes Chrome.
 It deliberately scopes extraction to Aukro's organic listing component and excludes
 recommendation sliders, widgets, and banners.
+Use --list-only to skip the detail step or --limit 10 for a small detail preview.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -34,6 +36,7 @@ LOGGER = logging.getLogger("aukro_scraper")
 
 DEFAULT_DEBUGGER_ADDRESS: Final = "127.0.0.1:9222"
 DEFAULT_OUTPUT: Final = Path("aukro_mince.json")
+DEFAULT_DETAILS_OUTPUT: Final = Path("aukro_mince_detail.json")
 DEFAULT_TIMEOUT_SECONDS: Final = 20.0
 
 LISTING_ROOT_SELECTOR: Final = (
@@ -462,6 +465,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--debugger-address", default=DEFAULT_DEBUGGER_ADDRESS)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--details-output",
+        type=Path,
+        default=DEFAULT_DETAILS_OUTPUT,
+        help="Output JSON for listings enriched with offer details",
+    )
+    parser.add_argument(
+        "--list-only",
+        action="store_true",
+        help="Save only the listing page, without fetching offer details",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Fetch details for only the first N listings (default: all)",
+    )
+    parser.add_argument(
+        "--detail-delay",
+        type=float,
+        default=1.0,
+        help="Seconds between offer detail requests",
+    )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
         "--max-scroll-passes",
@@ -483,6 +508,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_detail_scraper(args: argparse.Namespace) -> int:
+    """Run the detail CLI with the same Python interpreter and propagate failures."""
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().with_name("aukro_details.py")),
+        "--input", str(args.output.resolve()),
+        "--output", str(args.details_output.resolve()),
+        "--timeout", str(args.timeout),
+        "--delay", str(args.detail_delay),
+    ]
+    if args.limit is not None:
+        command.extend(["--limit", str(args.limit)])
+    LOGGER.info("Fetching offer details; output: %s", args.details_output.resolve())
+    return subprocess.run(command, check=False).returncode
+
+
 def main() -> int:
     args = build_argument_parser().parse_args()
     logging.basicConfig(
@@ -491,6 +532,12 @@ def main() -> int:
     )
     if args.timeout <= 0 or args.max_scroll_passes <= 0:
         LOGGER.error("--timeout and --max-scroll-passes must be positive")
+        return 2
+    if (args.limit is not None and args.limit <= 0) or args.detail_delay < 0:
+        LOGGER.error("--limit must be positive and --detail-delay cannot be negative")
+        return 2
+    if not args.list_only and args.output.resolve() == args.details_output.resolve():
+        LOGGER.error("--output and --details-output must be different files")
         return 2
 
     try:
@@ -512,8 +559,8 @@ def main() -> int:
             )
         write_json_atomic(args.output, listings)
         LOGGER.info("Saved %d listings to %s", len(listings), args.output.resolve())
-        return 0
-    except (ExtractionError, WebDriverException) as exc:
+        return 0 if args.list_only else run_detail_scraper(args)
+    except (ExtractionError, WebDriverException, OSError) as exc:
         LOGGER.error("%s", exc)
         return 1
     except KeyboardInterrupt:
